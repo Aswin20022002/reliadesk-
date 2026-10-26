@@ -1,7 +1,7 @@
 const assert = require('assert')
 const { getCandidates, runOne } = require('../.test-build/engine')
 const { runAgent } = require('../.test-build/agentLoop')
-const { chat } = require('../.test-build/llm')
+const { chat, resetModelCache } = require('../.test-build/llm')
 const { MODES } = require('../.test-build/kb')
 const { fmt } = require('../.test-build/time')
 
@@ -61,13 +61,13 @@ const toolStep = (...calls) => ok({ role: 'assistant', content: null, tool_calls
   process.env.GEMINI_API_KEY = 'test'
   script([{ ok: false, status: 429, json: async () => ({}) }, final(good)])
   const r7 = await chat({ messages: [{ role: 'user', content: 'x' }] })
-  assert.equal(r7.provider, 'gemini'); assert.deepEqual(r7.failed, ['groq: HTTP 429'])
+  assert.equal(r7.provider, 'gemini'); assert.equal(r7.failed.length, 1); assert.match(r7.failed[0], /^groq\/.+: HTTP 429$/)
   console.log('7 groq 429 -> gemini failover ok')
 
   // 8 everything down
   script([() => { throw new Error('boom') }])
   o = await runAgent(id, {})
-  assert.equal(o.source, 'rules'); assert.match(o.fallbackReason, /groq: network error; gemini: network error/)
+  assert.equal(o.source, 'rules'); assert.match(o.fallbackReason, /groq\/.+: network error; gemini\/.+: network error/)
   console.log('8 all providers down -> rules ok')
 
   // 9 tool budget + unknown tool do not crash
@@ -118,5 +118,38 @@ const toolStep = (...calls) => ok({ role: 'assistant', content: null, tool_calls
 
   assert.ok(MODES[rule.mode].cite.every((c) => /^https:\/\//.test(c.url) && c.doc && c.section)); 
   console.log('16 every knowledge-base excerpt has a document, a page and a source link ok')
+
+  // ---- model fallback inside one provider ----
+  resetModelCache()
+  delete process.env.GEMINI_API_KEY
+  let calls17 = []
+  global.fetch = async (u, o) => { const m = JSON.parse(o.body).model; calls17.push(m); return m === 'openai/gpt-oss-120b' ? { ok: false, status: 404, json: async () => ({}) } : ok({ role: 'assistant', content: 'hi' }) }
+  const r17 = await chat({ messages: [{ role: 'user', content: 'x' }] })
+  assert.equal(r17.provider, 'groq'); assert.equal(r17.model, 'openai/gpt-oss-20b'); assert.match(r17.failed[0], /gpt-oss-120b: HTTP 404/)
+  console.log('17 model returns 404 -> next model of the same provider used ok')
+
+  calls17 = []
+  await chat({ messages: [{ role: 'user', content: 'x' }] })
+  assert.equal(calls17[0], 'openai/gpt-oss-20b'); assert.equal(calls17.length, 1)
+  console.log('18 dead model remembered, not retried on the next call ok')
+
+  resetModelCache()
+  let bodies = []
+  global.fetch = async (u, o) => { bodies.push(JSON.parse(o.body)); return ok({ role: 'assistant', content: 'hi' }) }
+  await chat({ messages: [{ role: 'user', content: 'x' }], maxTokens: 300 })
+  assert.equal(bodies[0].reasoning_effort, 'low'); assert.equal(bodies[0].max_tokens, 900)
+  console.log('19 gpt-oss gets low reasoning effort and extra token headroom ok')
+
+  resetModelCache()
+  global.fetch = async () => ({ ok: false, status: 401, json: async () => ({}) })
+  await assert.rejects(chat({ messages: [{ role: 'user', content: 'x' }] }), (e) => e.failed.length === 1 && /HTTP 401/.test(e.failed[0]))
+  console.log('20 bad key stops that provider after one attempt ok')
+  resetModelCache()
+  delete process.env.GROQ_API_KEY; process.env.GEMINI_API_KEY = 'test'
+  let sent = null
+  global.fetch = async (u, o) => { sent = JSON.parse(o.body); return ok({ role: 'assistant', content: 'hi' }) }
+  await chat({ messages: [{ role: 'user', content: 'x' }, { role: 'assistant', content: null, tool_calls: [tc('lookup_manual', { mode: 'a' })] }, { role: 'tool', tool_call_id: 'c_lookup_manual', content: '{}' }] })
+  assert.equal(sent.messages[2].name, 'lookup_manual')
+  console.log('21 gemini tool-result messages carry the function name ok')
   console.log('ALL PASSED')
 })().catch((e) => { console.error('FAIL', e); process.exit(1) })
